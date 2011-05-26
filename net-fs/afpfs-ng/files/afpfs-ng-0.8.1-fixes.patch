@@ -1,0 +1,32 @@
+diff -Naur afpfs-ng-0.8.1.orig/cmdline/cmdline_afp.c afpfs-ng-0.8.1/cmdline/cmdline_afp.c
+--- afpfs-ng-0.8.1.orig/cmdline/cmdline_afp.c	2008-02-19 02:54:19.000000000 +0100
++++ afpfs-ng-0.8.1/cmdline/cmdline_afp.c	2011-05-19 23:12:31.319157941 +0200
+@@ -417,7 +417,7 @@
+ 	}
+ 
+ 	if (sscanf(modestring,"%o",&mode)!=1) {
+-		printf("Mode of %s isn't octal\n");
++		printf("Mode of %s isn't octal\n", modestring);
+ 		goto error;
+ 	}
+ 
+@@ -1217,7 +1217,7 @@
+ {
+ 	struct passwd * passwd;
+ 
+-	snprintf(curdir,PATH_MAX,"%s",DEFAULT_DIRECTORY);
++	snprintf(curdir,AFP_MAX_PATH,"%s",DEFAULT_DIRECTORY);
+ 	if (init_uams()<0) return -1;
+ 
+ 	afp_default_url(&url);
+diff -Naur afpfs-ng-0.8.1.orig/cmdline/getstatus.c afpfs-ng-0.8.1/cmdline/getstatus.c
+--- afpfs-ng-0.8.1.orig/cmdline/getstatus.c	2008-02-18 04:28:09.000000000 +0100
++++ afpfs-ng-0.8.1/cmdline/getstatus.c	2011-05-19 23:06:37.814406377 +0200
+@@ -1,6 +1,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <pthread.h>
++#include <stdlib.h>
+ 
+ #include "afp.h"
+ 
