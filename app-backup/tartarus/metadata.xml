@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "http://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<herd>no-herd</herd>
+	<maintainer>
+		<email>a3li@gentoo.org</email>
+		<name>Alex Legler</name>
+	</maintainer>
+	<use>
+		<flag name="afio">
+			Depend on <pkg>app-arch/afio</pkg> for AFIO archive support.
+		</flag>
+		<flag name="charon">
+			Install the charon(1) utilities for purging old backup archives.
+		</flag>
+		<flag name="crypt">
+			Depend on <pkg>app-crypt/gnupg</pkg> for backup encryption support.
+		</flag>
+		<flag name="lvm">
+			Depend on <pkg>sys-fs/lvm</pkg> for LVM snapshot backup support.
+		</flag>
+		<flag name="orpheus">
+			Install the EXPERIMENTAL orpheus(1) utility for requesting single files from backup archives.
+		</flag>
+		<flag name="pbzip2">
+			Depend on <pkg>app-arch/pbzip2</pkg> to allow usage of pbzip2 as a archive compressor.
+		</flag>
+	</use>
+</pkgmetadata>
