@@ -1,0 +1,1108 @@
+From 2d3299f6f93420ec83f94a2b2ab1d8c08f9528ac Mon Sep 17 00:00:00 2001
+From: James Hogan <james@albanarts.com>
+Date: Tue, 12 Jan 2010 23:12:44 +0000
+Subject: [PATCH] Support for KDE 3 & 4, background capture to stop icons being overwirtten.
+
+The KDE 4 desktop is called plasma-desktop and it doesn't work well with
+xpenguins. XClearArea on it doesn't have an effect so penguins leave trails
+wherever they go.
+
+As well as adding code to detect which window to draw to in KDE 3.5 and 4.3
+(there are currently problems with 4.0), this change works around the above
+problem and that of icons being overwritten with a new command line option
+-g/--bgcapture. When enabled XPenguins captures the contents of the window it
+draws to when it starts, and attempts to keep the capture up to date by
+randomly exposing and recapturing rectangles of the desktop that penguins are
+not overlapping. It then copies from the image to erase the penguins and
+restore the background.
+
+Not yet working / not yet tested:
+* KDE 4.0 desktop can't be drawn to
+* Not tested with multiple monitors or panned desktops
+
+More detailed changes:
+* added -bgcapture option
+* updated man page with info about -bgcapture option
+* only walk on windows on the current desktop
+* new draw mode where the canvas of the root window is captured and redrawn
+* capture updated by exposing and recapturing unused rectangles of the screen
+* fix erasing of toon's to erase exact previous shape (taking into account
+  that it may have changed form).
+* improved root window searching
+  essense of KDE desktop window finding reduced to an algorithm and a set of
+  data structures for each variation to define the matching rules.
+* matching rules for KDE 2.0 from the old function
+* matching rules for KDE 3(.5) and KDE 4(.3)
+---
+ src/main.c         |    4 +
+ src/toon.h         |    8 ++
+ src/toon_core.c    |  102 ++++++++++++++++
+ src/toon_draw.c    |  339 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ src/toon_globals.c |    4 +
+ src/toon_init.c    |    9 ++
+ src/toon_root.c    |  324 ++++++++++++++++++++++++++++++++++++--------------
+ src/toon_signal.c  |    1 +
+ xpenguins.1        |   11 ++
+ 9 files changed, 707 insertions(+), 95 deletions(-)
+
+diff --git a/src/main.c b/src/main.c
+index e794328..c64fd06 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -147,6 +147,9 @@ main (int argc, char **argv)
+     else if (ArgumentIs("-r", "-rectwin")) {
+       rectangular_windows = 1;
+     }
++    else if (ArgumentIs("-g", "-bgcapture")) {
++      ToonConfigure(TOON_BGCAPTURE);
++    }
+     else if (ArgumentIs("-h", "-help")) {
+       fprintf(stdout, _("XPenguins %s (%s) by %s\n"),
+ 	      XPENGUINS_VERSION, XPENGUINS_DATE, XPENGUINS_AUTHOR);
+@@ -405,6 +408,7 @@ ShowUsage(char **argv)
+ 	    "  -c, --config-dir     <dir>        Look for config files (and themes) in <dir>\n"
+ 	    "  -p, --ignorepopups                Penguins ignore \"popup\" windows\n"
+ 	    "  -r, --rectwin                     Regard shaped windows as rectangular\n"
++            "  -g, --bgcapture                   Capture image of desktop and use to repaint\n"
+ 	    "  -t, --theme          <theme>      Use named <theme>\n"
+ 	    "  -l, --list-themes                 List available themes\n"
+ 	    "  -i, --theme-info                  Describe a theme and exit (use with -t)\n"
+diff --git a/src/toon.h b/src/toon.h
+index 31117f4..36542b4 100644
+--- a/src/toon.h
++++ b/src/toon.h
+@@ -56,6 +56,8 @@
+ #define TOON_SHAPEDWINDOWS (1L<<7)
+ #define TOON_SQUISH (1L<<8)
+ #define TOON_NOSQUISH (1L<<9)
++#define TOON_NOBGCAPTURE (1L<<10)
++#define TOON_BGCAPTURE (1L<<11)
+ 
+ #define TOON_NOCATCHSIGNALS (1L<<16)
+ #define TOON_CATCHSIGNALS (1L<<17)
+@@ -98,6 +100,7 @@ typedef struct {
+   unsigned int genus, type, frame, direction;
+   int x_map, y_map;
+   unsigned int width_map, height_map;
++  unsigned int genus_map, type_map, frame_map, direction_map;
+     /* properties of the image mapped on the screen */
+   unsigned int associate; /* toon is associated with a window */
+   int xoffset, yoffset; /* location relative to window origin */
+@@ -132,6 +135,7 @@ extern Window toon_parent; /* the parent window of all the client windows */
+ extern Window toon_root_override; /* override both toon_root and toon_parent */
+ extern int toon_x_offset, toon_y_offset; /* toon_root relative to toon_parent */
+ extern int toon_display_width, toon_display_height;
++extern int toon_display_depth;
+ extern GC toon_drawGC;
+ extern Region toon_windows;
+ extern unsigned int toon_nwindows;
+@@ -155,6 +159,9 @@ extern int toon_button_y;
+ extern char toon_expose;
+ extern char toon_squish;
+ extern Window toon_squish_window;
++extern char toon_bgcapture;
++extern char toon_root_copy_obtained;
++extern Pixmap toon_root_copy;
+ 
+ /*** FUNCTION PROTOTYPES ***/
+ 
+@@ -202,6 +209,7 @@ void ToonSetVelocity(Toon *toon, int u, int v);
+ 
+ /* CORE FUNCTIONS (toon_core.c) */
+ int ToonAdvance(Toon *toon, int mode);
++int ToonCurrentDesktop();
+ int ToonLocateWindows();
+ int ToonSleep(unsigned long usecs);
+ 
+diff --git a/src/toon_core.c b/src/toon_core.c
+index 2a86676..6382d79 100644
+--- a/src/toon_core.c
++++ b/src/toon_core.c
+@@ -17,6 +17,7 @@
+  */
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <X11/Xatom.h>
+ #include "toon.h"
+ 
+ /* Error handler for X */
+@@ -151,6 +152,82 @@ ToonAdvance(Toon *toon, int mode)
+   return result;
+ }
+ 
++/* Get the window with the interesting window properties from the child of the
++   main parent window */
++static Window
++ToonGetWindowFromChild(Window parent, int depth,
++                       Atom property, Atom reg_type,
++                       unsigned char **prop_return)
++{
++  unsigned long nitems, bytesafter;
++  Atom actual_type;
++  int actual_format;
++
++  Window dummy;
++  int wx;
++  Window *children = NULL;
++  unsigned int nchildren = 0;
++
++  int i;
++  Window result = 0;
++
++  /* check for the property */
++  if (XGetWindowProperty(toon_display, parent,
++                         property, 0, 1,
++                         False, reg_type,
++                         &actual_type, &actual_format,
++                         &nitems, &bytesafter,
++                         prop_return) == Success
++      && *prop_return) {
++    return parent;
++  }
++
++  if (depth) {
++    wx = XQueryTree(toon_display, parent, &dummy, &dummy,
++                    &children, &nchildren);
++    if (wx && children) {
++      for (i = 0; i < nchildren; ++i) {
++        result = ToonGetWindowFromChild(children[i], depth-1,
++                                        property, reg_type,
++                                        prop_return);
++        if (result) {
++          break;
++        }
++      }
++      XFree(children);
++    }
++  }
++
++  return result;
++}
++
++/* Find which desktop we're on */
++int
++ToonCurrentDesktop()
++{
++  Atom current_desktop_atom = XInternAtom(toon_display, 
++                                          "_NET_CURRENT_DESKTOP",
++                                          False);
++  unsigned long nitems, bytesafter;
++  Atom actual_type;
++  int actual_format;
++  int *desktop_num_ptr = NULL;
++  int desktop_num = -1;
++
++  if (XGetWindowProperty(toon_display, toon_parent,
++                         current_desktop_atom, 0, 1,
++                         False, XA_CARDINAL,
++                         &actual_type, &actual_format,
++                         &nitems, &bytesafter,
++                         (unsigned char **) &desktop_num_ptr) == Success
++      && desktop_num_ptr) {
++    desktop_num = *desktop_num_ptr;
++    XFree(desktop_num_ptr);
++  }
++
++  return desktop_num;
++}
++
+ /* Build up an X-region corresponding to the location of the windows 
+    that we don't want our toons to enter */
+ /* Returns 0 on success, 1 if windows moved again during the execution
+@@ -167,6 +244,15 @@ ToonLocateWindows()
+   unsigned int height, width;
+   unsigned int oldnwindows;
+ 
++  int desktop_num = -1;
++  int *desktop_num_ptr = NULL;
++  Atom wm_desktop_atom = XInternAtom(toon_display, 
++                                     "_NET_WM_DESKTOP",
++                                     False);
++  unsigned long nitems, bytesafter;
++  Atom actual_type;
++  int actual_format;
++
+   XRectangle *rects = NULL;
+   int nrects, rectord, irect;
+   XSetErrorHandler(__ToonXErrorHandler);
+@@ -198,6 +284,9 @@ ToonLocateWindows()
+     toon_y_offset = attributes.y;
+   }
+ 
++  /* Find which desktop we're on */
++  desktop_num = ToonCurrentDesktop();
++
+   /* Add windows to region */
+   for (wx=0; wx<toon_nwindows; wx++) {
+     toon_errno = 0;
+@@ -231,6 +320,19 @@ ToonLocateWindows()
+       window_rect->y = y;
+       window_rect->height = height;
+       window_rect->width = width;
++
++      /* Check window is on current desktop */
++      if (desktop_num >= 0
++          && ToonGetWindowFromChild(children[wx], 2,
++                                    wm_desktop_atom, XA_CARDINAL,
++                                    (unsigned char **) &desktop_num_ptr)) {
++        int wm_desktop_num = *desktop_num_ptr;
++        XFree(desktop_num_ptr);
++        if (wm_desktop_num != -1 && wm_desktop_num != desktop_num) {
++          continue;
++        }
++      }
++
+       /* The area of the windows themselves */
+       if (!toon_shaped_windows) {
+ 	XUnionRectWithRegion(window_rect, toon_windows, toon_windows);
+diff --git a/src/toon_draw.c b/src/toon_draw.c
+index 1f24408..6fb91b1 100644
+--- a/src/toon_draw.c
++++ b/src/toon_draw.c
+@@ -16,15 +16,307 @@
+  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+  */
+ #include <stdio.h>
++#include <stdlib.h>
+ #include "toon.h"
++
++/* exposing and recapturing areas of screen */
++
++#define EXPOSE_PROB 30
++#define EXPOSE_DIRECTION 90
++#define EXPOSE_UNIFORMITY 1
++#define EXPOSE_HISTORY_LENGTH 5
++/*#define EXPOSE_DEBUG*/
++
++static int exposing = 0;
++static int expose_bounds[2][2];
++
++static int expose_history_start = 0;
++static int expose_history_length = 0;
++static int expose_history[EXPOSE_HISTORY_LENGTH][2][2];
++
++int *
++ToonExposingHistoryFetch(int id)
++{
++  int index = (expose_history_start + id) % EXPOSE_HISTORY_LENGTH;
++  return &expose_history[index][0][0];
++}
++
++int
++ToonExposingHistoryPop()
++{
++  if (expose_history_length) {
++    ++expose_history_start;
++    --expose_history_length;
++  }
++}
++
++int
++ToonExposingHistoryPush()
++{
++  int *item;
++
++  if (expose_history_length >= EXPOSE_HISTORY_LENGTH) {
++    ToonExposingHistoryPop();
++  }
++
++  item = ToonExposingHistoryFetch(expose_history_length);
++  item[0] = expose_bounds[0][0];
++  item[1] = expose_bounds[0][1];
++  item[2] = expose_bounds[1][0];
++  item[3] = expose_bounds[1][1];
++  ++expose_history_length;
++}
++
++#define RandInt(maxint) ((int) ((maxint)*((float) rand()/(RAND_MAX+1.0))))
++
++/* adjust bounds to exclude the specified rectangle */
++int
++ToonExposingBound(int *pos, int *rect_pos, int *rect_size, int flex)
++{
++  int rect_cent[2] = { rect_pos[0] + rect_size[0]/2,
++                       rect_pos[1] + rect_size[1]/2 };
++  int greater, min, max;
++  int retry = 0;
++
++  /* in which direction are we furthest from (x, y)? */
++  greater = (abs(rect_cent[0] - pos[0]) <= abs(rect_cent[1] - pos[1]));
++try_again:
++  min = rect_pos[greater] - flex;
++  max = rect_pos[greater] + rect_size[greater] + flex;
++  /* shrink the bounds */
++  if (min > pos[greater]) {
++    if (min < expose_bounds[greater][1]) {
++      expose_bounds[greater][1] = min;
++    }
++  }
++  else if (max < pos[greater]) {
++    if (max > expose_bounds[greater][0]) {
++      expose_bounds[greater][0] = max;
++    }
++  }
++  else if (!retry) {
++    retry = 1;
++    greater = !greater;
++    goto try_again;
++  }
++  else {
++    return 1;
++  }
++  return 0;
++}
++
++void
++ToonExposingExpose(Toon *t, int n)
++{
++  const int win_flex = 0;
++  const int toon_flex = 3;
++
++  static int burst_countdown = 0;
++  int attempts = 100;
++  int expose_prob = EXPOSE_PROB;
++  int pos[2];
++  int i, j;
++  XExposeEvent expose;
++
++  static int last_desktop = -2;
++  int current_desktop = -1;
++
++  if (exposing || !toon_root_copy_obtained) {
++    return;
++  }
++
++  current_desktop = ToonCurrentDesktop();
++  if (last_desktop == -2) {
++    last_desktop = current_desktop;
++  }
++  else if (last_desktop != current_desktop) {
++    /* desktop has changed, do exposes for the next 200 frames */
++    burst_countdown = 200;
++    last_desktop = current_desktop;
++  }
++
++  if (burst_countdown) {
++    expose_prob = 100;
++    expose_history_length = 0;
++    --burst_countdown;
++  }
++
++  if (RandInt(100) >= expose_prob) {
++    return;
++  }
++
++try_again:
++  if (!--attempts) {
++    ToonExposingHistoryPop();
++    return;
++  }
++
++  expose_bounds[0][0] = 0;
++  expose_bounds[0][1] = ToonDisplayWidth();
++  expose_bounds[1][0] = 0;
++  expose_bounds[1][1] = ToonDisplayHeight();
++
++  /* Choose a random location on the screen */
++
++  if (n) {
++    i = RandInt(n);
++    j = RandInt(8+EXPOSE_UNIFORMITY);
++#ifdef EXPOSE_DIRECTION
++    if (j < 4 && RandInt(100) <= EXPOSE_DIRECTION) {
++      switch (t[i].direction) {
++        case TOON_LEFT:
++          j = 1;
++          break;
++        case TOON_RIGHT:
++          j = 0;
++          break;
++        case TOON_UP:
++          j = 3;
++          break;
++        case TOON_DOWN:
++          j = 2;
++          break;
++        case TOON_UPLEFT:
++          j = 7;
++          break;
++        case TOON_UPRIGHT:
++          j = 6;
++          break;
++        case TOON_DOWNLEFT:
++          j = 5;
++          break;
++        case TOON_DOWNRIGHT:
++          j = 4;
++          break;
++        default:
++          break;
++      }
++    }
++#endif
++  }
++  else {
++    j = 4;
++  }
++  switch (j) {
++    case 0: /* left */
++      pos[0] = t[i].x - toon_flex - 1;
++      pos[1] = t[i].y + t[i].height_map/2;
++      break;
++    case 1: /* right */
++      pos[0] = t[i].x + t[i].width_map + toon_flex + 1;
++      pos[1] = t[i].y + t[i].height_map/2;
++      break;
++    case 2: /* top */
++      pos[0] = t[i].x + t[i].width_map/2;
++      pos[1] = t[i].y - toon_flex - 1;
++      break;
++    case 3: /* bottom */
++      pos[0] = t[i].x + t[i].width_map/2;
++      pos[1] = t[i].y + t[i].height_map + toon_flex + 1;
++      break;
++    case 4: /* top left */
++      pos[0] = t[i].x - toon_flex - 1;
++      pos[1] = t[i].y - toon_flex - 1;
++      break;
++    case 5: /* top right */
++      pos[0] = t[i].x + t[i].width_map + toon_flex + 1;
++      pos[1] = t[i].y - toon_flex - 1;
++      break;
++    case 6: /* bottom left */
++      pos[0] = t[i].x - toon_flex - 1;
++      pos[1] = t[i].y + t[i].height_map + toon_flex + 1;
++      break;
++    case 7: /* bottom right */
++      pos[0] = t[i].x + t[i].width_map + toon_flex + 1;
++      pos[1] = t[i].y + t[i].height_map + toon_flex + 1;
++      break;
++    default: /* uniform random */
++      pos[0] = RandInt(ToonDisplayWidth());
++      pos[1] = RandInt(ToonDisplayHeight());
++      break;
++  }
++
++  /* Find fairly maximal rectangle around pos */
++
++  if (toon_windata) {
++    for (i = 0; i < toon_nwindows; ++i) {
++      int win_pos[2] = { t->x, t->y };
++      int win_size[2] = { t->width_map, t->height_map };
++      if (ToonExposingBound(pos, win_pos, win_size, win_flex)) {
++        goto try_again;
++      }
++    }
++  }
++
++  for (i = 0; i < expose_history_length; ++i) {
++    int *rect = ToonExposingHistoryFetch(i);
++    int rect_pos[2] = { rect[0], rect[2] };
++    int rect_size[2] = { rect[1] - rect[0], rect[3] - rect[2] };
++    if (ToonExposingBound(pos, rect_pos, rect_size, 0)) {
++      goto try_again;
++    }
++  }
++
++  for (i = 0; i < n; ++i, ++t) {
++    int toon_pos[2] = { t->x, t->y };
++    int toon_size[2] = { t->width_map, t->height_map };
++    if (ToonExposingBound(pos, toon_pos, toon_size, toon_flex)) {
++      goto try_again;
++    }
++  }
++
++  /* Trigger the actual expose event */
++
++  expose.type        = Expose;
++  expose.send_event  = True;
++  expose.display     = toon_display;
++  expose.window      = toon_root;
++  expose.x           = expose_bounds[0][0];
++  expose.y           = expose_bounds[1][0];
++  expose.width       = expose_bounds[0][1] - expose_bounds[0][0] + 1;
++  expose.height      = expose_bounds[1][1] - expose_bounds[1][0] + 1;
++  XSendEvent(toon_display, toon_root, True, Expose,
++             (XEvent *) &expose);
++
++  ToonExposingHistoryPush();
++
++  exposing = 1;
++}
++
++int
++ToonExposingRecapture()
++{
++  /* recapture exposed region */
++
++  if (toon_root_copy_obtained && exposing) {
++    XCopyArea(toon_display, toon_root, toon_root_copy, toon_drawGC,
++              expose_bounds[0][0],
++              expose_bounds[1][0],
++              expose_bounds[0][1] - expose_bounds[0][0],
++              expose_bounds[1][1] - expose_bounds[1][0],
++              expose_bounds[0][0],
++              expose_bounds[1][0]);
++    exposing = 0;
++
++#ifdef EXPOSE_DEBUG
++    XDrawRectangle(toon_display, toon_root, toon_drawGC,
++                   expose_bounds[0][0],
++                   expose_bounds[1][0],
++                   expose_bounds[0][1] - expose_bounds[0][0],
++                   expose_bounds[1][1] - expose_bounds[1][0]);
++#endif
++  }
++}
++
+ /* DRAWING FUNCTIONS */
+ 
+ /* Draw the toons from toon[0] to toon[n-1] */
+ /* Currently always returns 0 */
+ int
+-ToonDraw(Toon *t, int n)
++ToonDraw(Toon *toons, int n)
+ {
+   int i;
++  Toon *t = toons;
+   for (i = 0; i < n; i++, t++) {
+     if (t->active) {
+       ToonData *data = toon_data[t->genus] + t->type;
+@@ -39,19 +331,26 @@ ToonDraw(Toon *t, int n)
+ 		     t->x-width*t->frame, t->y-height*direction); 
+       XSetClipMask(toon_display, toon_drawGC, data->mask);   
+       XCopyArea(toon_display, data->pixmap,
+-		toon_root,toon_drawGC,width*t->frame,height*direction,
+-		width,height,t->x,t->y);
++		toon_root, toon_drawGC, width*t->frame, height*direction,
++		width, height, t->x, t->y);
+       XSetClipMask(toon_display, toon_drawGC, None);
+       t->x_map = t->x;
+       t->y_map = t->y;
+       t->width_map = width;
+       t->height_map = height;
++      t->genus_map = t->genus;
++      t->type_map = t->type;
++      t->frame_map = t->frame;
++      t->direction_map = direction;
+       t->mapped = 1;
+     }
+     else {
+       t->mapped = 0;
+     }
+   }
++  
++  ToonExposingExpose(toons, n);
++
+   return 0;
+ }
+ 
+@@ -69,6 +368,8 @@ ToonErase(Toon *t, int n)
+   static int count = 0;
+ 
+   int i;
++  
++  ToonExposingRecapture();
+ 
+   for (i = 0; i < n; i++, t++) {
+     if (t->mapped) {
+@@ -76,8 +377,23 @@ ToonErase(Toon *t, int n)
+       int y = t->y_map;
+       int width = t->width_map;
+       int height = t->height_map;
+-      XClearArea(toon_display, toon_root, x, y,
+-		 width, height, False);
++      int frame = t->frame_map;
++      int direction = t->direction_map;
++      int genus = t->genus_map;
++      int type = t->type_map;
++      if (toon_root_copy_obtained) {
++        ToonData *data = toon_data[genus] + type;
++        XSetClipOrigin(toon_display, toon_drawGC,
++                       x - width*frame, y - height*direction); 
++        XSetClipMask(toon_display, toon_drawGC, data->mask);   
++        XCopyArea(toon_display, toon_root_copy, toon_root, toon_drawGC,
++                  x, y, width, height, x, y);
++        XSetClipMask(toon_display, toon_drawGC, None);
++      }
++      else {
++        XClearArea(toon_display, toon_root, x, y,
++                   width, height, False);
++      }
+       if (toon_expose) {
+ 	if (x < minx) {
+ 	  minx = x;
+@@ -95,7 +411,18 @@ ToonErase(Toon *t, int n)
+     }
+   }
+ 
+-  if (toon_expose && count > 100
++  if (toon_bgcapture && !toon_root_copy_obtained) {
++    toon_root_copy = XCreatePixmap(toon_display, toon_root,
++                                   toon_display_width, toon_display_height,
++                                   toon_display_depth);
++    XCopyArea(toon_display, toon_root, toon_root_copy, toon_drawGC,
++              0, 0, toon_display_width, toon_display_height,
++              0, 0);
++    toon_root_copy_obtained = 1;
++  }
++
++  if (!toon_root_copy_obtained
++      && toon_expose && count > 100
+       && maxx > minx && maxy > miny) {
+     XExposeEvent event;
+ 
+diff --git a/src/toon_globals.c b/src/toon_globals.c
+index de5183f..3f887f7 100644
+--- a/src/toon_globals.c
++++ b/src/toon_globals.c
+@@ -24,6 +24,7 @@ Window toon_root_override = 0;
+ int toon_x_offset = 0;
+ int toon_y_offset = 0;
+ int toon_display_width, toon_display_height;
++int toon_display_depth;
+ GC toon_drawGC = NULL;
+ Region toon_windows = NULL;
+ unsigned int toon_nwindows = 0;
+@@ -52,3 +53,6 @@ int toon_button_y = -1;
+ char toon_expose;
+ char toon_squish = 0;
+ Window toon_squish_window = (Window) 0;
++char toon_bgcapture = 0;
++char toon_root_copy_obtained = 0;
++Pixmap toon_root_copy = (Pixmap) 0;
+diff --git a/src/toon_init.c b/src/toon_init.c
+index 99a5eea..9834e2c 100644
+--- a/src/toon_init.c
++++ b/src/toon_init.c
+@@ -66,6 +66,7 @@ ToonInit(Display *d)
+   XGetWindowAttributes(toon_display, toon_root, &attributes);
+   toon_display_width = attributes.width;
+   toon_display_height = attributes.height;
++  toon_display_depth = attributes.depth;
+   if (toon_root != toon_parent) {
+     /* Work out the position of toon_root with respect to toon_parent;
+      * assume for now that toon_parent is the same size as the root
+@@ -108,6 +109,7 @@ ToonInit(Display *d)
+   }
+   else {
+     toon_expose = 0;
++    toon_bgcapture = 0;
+   }
+   
+   /* Set Graphics Context */
+@@ -191,6 +193,13 @@ ToonConfigure(unsigned long int code)
+     toon_squish = 0;
+   }
+ 
++  if (code & TOON_NOBGCAPTURE) {
++    toon_bgcapture=0;
++  }
++  else if (code & TOON_BGCAPTURE) {
++    toon_bgcapture=1;
++  }
++
+   return 0;
+ }
+ 
+diff --git a/src/toon_root.c b/src/toon_root.c
+index 68dca1a..fa77a24 100644
+--- a/src/toon_root.c
++++ b/src/toon_root.c
+@@ -96,100 +96,241 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
+-/* Time to throw up. Here is a kludgey function that recursively calls
+- * itself (up to a limit) to find the window ID of the KDE desktop to
+- * draw on. It works with KDE 2.0, but since KDE 2.0 is less stable
+- * than Windows 95, I don't expect many people to remain using it now
+- * that 2.1 is available, which implements __SWM_VROOT and makes this
+- * function redundant. This is the hierarchy we're trying to traverse:
+- *
+- * -> The root window
+- * 0 -> window with name="KDE Desktop"
+- * 1   -> window with no name
+- * 2     -> window with name="KDE Desktop" & _NET_WM_WINDOW_TYPE_DESKTOP
+- * 3       -> window with no name and width >= width of screen
+- * 
+- * The last window in the hierarchy is the one to draw to.  The
+- * numbers show the value of the `depth' argument.  */
+-static
+-Window
+-__ToonGetKDEDesktop(Display *display, int screen, Window window,
+-		    Atom atom, char *atomname, int depth)
++/* We use a common algorithm to search complex desktop window heirarchies.
++ * The following structures store the data that is specific to each desktop.
++ */
++
++/* Matching rules */
++typedef struct {
++  char *name;
++} ToonMatchRuleName;
++typedef struct {
++  char *class_name;
++} ToonMatchRuleClassName;
++typedef struct {
++  char *atom_name;
++  char *value;
++} ToonMatchRuleProperty;
++typedef struct {
++  char can_be_greater;
++} ToonMatchRuleSize;
++/* A common structure which can optionally have all of the above */
++typedef struct __ToonMatchRule ToonMatchRule;
++struct __ToonMatchRule {
++  ToonMatchRuleName *name;
++  ToonMatchRuleClassName *class_name;
++  ToonMatchRuleProperty *property;
++  ToonMatchRuleSize *size;
++};
++/* A window matcher has a list of rules */
++typedef struct __ToonMatchWindow ToonMatchWindow;
++struct __ToonMatchWindow {
++  int num_rules;
++  ToonMatchRule *rules;
++};
++/* A desktop matcher describes the heirarchy of windows find */
++typedef struct {
++  int depth;
++  ToonMatchWindow *windows;
++  char *name;
++  char can_clear; /* Does XClearArea reveal the background */
++} ToonMatcher;
++
++/* Handy macros for concisely describing the heirarchy of a desktop */
++#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
++#define TOON_MATCH_WINDOW(rules) { ARRAY_SIZE(rules), rules }
++#define TOON_MATCHER(wins, name, clear) { ARRAY_SIZE(wins), wins, name, clear }
++/* Defines a function for performing the search algorithm for a desktop */
++#define TOON_MATCH_FUNC(func_name, match) \
++  static Window func_name(Display *display, int screen, Window window) \
++  { \
++    ToonMatcher *matcher = (match); \
++    Window result = __ToonGetDesktop(display, screen, window, matcher, 0); \
++    if (result) { \
++      snprintf(toon_message, TOON_MESSAGE_LENGTH, \
++               _("Drawing to %s desktop"), matcher->name); \
++      toon_message[TOON_MESSAGE_LENGTH-1] = '\0'; \
++      if (!matcher->can_clear) { \
++        toon_bgcapture = 1; \
++      } \
++    } \
++    return result; \
++  }
++
++/* Finds the desktop window using a particular matching structure.
++ * Start depth at 0 with the children of the root window.
++ */
++static Window
++__ToonGetDesktop(Display *display, int screen, Window window,
++		 ToonMatcher *match, int depth)
+ {
+-  char *name = NULL;
+-  Atom *wintype = NULL;
+-  Window winreturn = 0;
+-  unsigned long nitems, bytesafter;
+-  Atom actual_type;
+-  int actual_format;
+-  Window rootReturn, parentReturn, *children;
+-  unsigned int nChildren;
+-  char go_deeper = 0;
++  Window result = (Window)0;
++  ToonMatchWindow *win_match = &match->windows[depth];
++  int i;
++  ToonMatchRule *rule = win_match->rules;
++  int w = DisplayWidth(display, screen);
++  int h = DisplayHeight(display, screen);
++  int go_deeper = 1;
+ 
+-  if (XFetchName(display, window, &name)) {
+-    if (strcasecmp(name, "KDE Desktop") == 0) {
+-      /* Presumably either at depth 0 or 2 */
++  /* Check this window against the rules */
++  for (i = 0; i < win_match->num_rules; ++i, ++rule) {
++    if (rule->name) {
++      char *tmp_name;
++      if (XFetchName(display, window, &tmp_name)) {
++        if (!rule->name->name || strcasecmp(rule->name->name, tmp_name)) {
++          go_deeper = 0;
++        }
++        XFree(tmp_name);
++      }
++      else if (rule->name->name) {
++        go_deeper = 0;
++      }
++    }
++    if (rule->property) {
++      Atom atom = XInternAtom(display, 
++                              rule->property->atom_name,
++                              False);
++      unsigned long nitems, bytesafter;
++      Atom actual_type;
++      int actual_format;
++      Atom *prop_val = NULL;
+       if (XGetWindowProperty(display, window, atom, 0, 1,
+-			     False, XA_ATOM,
+-			     &actual_type, &actual_format,
+-			     &nitems, &bytesafter,
+-			     (unsigned char **) &wintype) == Success
+-	  && wintype) {
+-	char *tmpatomname = XGetAtomName(display, *wintype);
+-	if (tmpatomname) {
+-	  if (strcmp(atomname, tmpatomname) == 0 && depth == 2) {
+-	    /* OK, at depth 2 */
+-	    go_deeper = 1;
+-	  }
+-	  XFree((char *) tmpatomname);
+-	}
++                             False, XA_ATOM,
++                             &actual_type, &actual_format,
++                             &nitems, &bytesafter,
++                             (unsigned char **) &prop_val) == Success
++          && prop_val) {
++        char *tmpatomname = XGetAtomName(display, *prop_val);
++        if (tmpatomname) {
++          if (strcmp(rule->property->value, tmpatomname)) {
++            go_deeper = 0;
++          }
++          XFree((char *) tmpatomname);
++        }
++        XFree((char *) prop_val);
+       }
+-      else if (depth < 2) {
+-	go_deeper = 1;
++      else {
++        go_deeper = 0;
+       }
+     }
+-    else if (depth == 1) {
+-      go_deeper = 1;
++    if (rule->size) {
++      XWindowAttributes attributes;
++      if (XGetWindowAttributes(display, window, &attributes)
++          && ((attributes.width < w || attributes.height < h)
++              || (!rule->size->can_be_greater
++                  && (attributes.width > w || attributes.height > h)))) {
++        go_deeper = 0;
++      }
+     }
+-    XFree((char *) name);
+   }
+-  else if (depth == 1) {
+-    go_deeper = 1;
+-  }
+-
+-  /* If go_deeper is 1 then there is a possibility that the background
+-   * window is a descendant of the current window; otherwise we're
+-   * barking up the wrong tree. */
+-  if (go_deeper && XQueryTree(display, window, &rootReturn,
+-			      &parentReturn, &children,
+-			      &nChildren)) {
+-    int i;
+-    for (i = 0; i < nChildren; ++i) {
+-      /* children[i] is now at depth 3 */
+-      if (depth == 2) {
+-	XWindowAttributes attributes;
+-	if (XGetWindowAttributes(display, children[i], &attributes)) {
+-	  if (attributes.width >= DisplayWidth(display, screen)/2
+-	      && attributes.height > 0) {
+-	    /* Found it! */
+-	    winreturn = children[i];
+-	    break;
+-	  }
+-	}
+-      }
+-      else if ((winreturn = __ToonGetKDEDesktop(display, screen,
+-						children[i],
+-						atom, atomname,
+-						depth+1))) {
+-	break;
++  /* If no problems, go to the parent looking for the next match */
++  if (go_deeper) {
++    if (++depth < match->depth) {
++      Window rootReturn, parentReturn, *children;
++      unsigned int nChildren;
++      if (XQueryTree(display, window, &rootReturn,
++                     &parentReturn, &children,
++                     &nChildren)) {
++        int i;
++        for (i = 0; i < nChildren; ++i) {
++          if ((result = __ToonGetDesktop(display, screen, children[i],
++                                         match, depth))) {
++            break;
++          }
++        }
++        XFree((char *) children);
+       }
+     }
+-    XFree((char *) children);
++    else {
++      result = window;
++    }
+   }
+-
+-  return winreturn;
++  return result;
+ }
+ 
++/* Common matching rules */
++
++static ToonMatchRuleName noname_rule = { NULL };
++static ToonMatchRuleSize size_rule = { 1 };
++static ToonMatchRuleProperty desktop_type_rule
++  = { "_NET_WM_WINDOW_TYPE", "_NET_WM_WINDOW_TYPE_DESKTOP" };
++
++/* KDE 4
++ * -> The root window
++ * 0 -> window with no name
++ * 1   -> window with no name
++ * 2     -> window with name="plasma-desktop" & _NET_WM_WINDOW_TYPE_DESKTOP
++ */
++
++static ToonMatchRuleName kde4_name_rule = { "plasma-desktop" };
++static ToonMatchRule kde4_match_rules_0_1[]
++  = { { &noname_rule, NULL, NULL, &size_rule } };
++static ToonMatchRule kde4_match_rules_2[]
++  = { { &kde4_name_rule, NULL, &desktop_type_rule, &size_rule } };
++static ToonMatchWindow kde4_matcher_windows[] = {
++  TOON_MATCH_WINDOW(kde4_match_rules_0_1),
++  TOON_MATCH_WINDOW(kde4_match_rules_0_1),
++  TOON_MATCH_WINDOW(kde4_match_rules_2)
++};
++static ToonMatcher kde4_matcher = TOON_MATCHER(kde4_matcher_windows,
++                                               "KDE 4", 0);
++TOON_MATCH_FUNC(__ToonGetKDE4Desktop, &kde4_matcher)
++
++/* KDE 3
++ * -> The root window
++ * 0 -> window with no name
++ * 1   -> window with no name
++ * 2     -> window with name="KDE Desktop" & _NET_WM_WINDOW_TYPE_DESKTOP
++ * 3       -> window with no name and width >= width of screen
++ * 4         -> window with no name and width >= width of screen
++ */
++
++static ToonMatchRuleName kde3_name_rule = { "KDE Desktop" };
++static ToonMatchRule kde3_match_rules_0_1_3_4[]
++  = { { &noname_rule, NULL, NULL, &size_rule } };
++static ToonMatchRule kde3_match_rules_2[]
++  = { { &kde3_name_rule, NULL, &desktop_type_rule, &size_rule } };
++static ToonMatchWindow kde3_matcher_windows[] = {
++  TOON_MATCH_WINDOW(kde3_match_rules_0_1_3_4),
++  TOON_MATCH_WINDOW(kde3_match_rules_0_1_3_4),
++  TOON_MATCH_WINDOW(kde3_match_rules_2),
++  TOON_MATCH_WINDOW(kde3_match_rules_0_1_3_4),
++  TOON_MATCH_WINDOW(kde3_match_rules_0_1_3_4)
++};
++static ToonMatcher kde3_matcher = TOON_MATCHER(kde3_matcher_windows,
++                                               "KDE 3", 1);
++TOON_MATCH_FUNC(__ToonGetKDE3Desktop, &kde3_matcher)
++
++/* KDE 2
++ * It works with KDE 2.0, but since KDE 2.0 is less stable
++ * than Windows 95, I don't expect many people to remain using it now
++ * that 2.1 is available, which implements __SWM_VROOT and makes this
++ * function redundant. This is the hierarchy we're trying to traverse:
++ *
++ * -> The root window
++ * 0 -> window with name="KDE Desktop"
++ * 1   -> window with no name
++ * 2     -> window with name="KDE Desktop" & _NET_WM_WINDOW_TYPE_DESKTOP
++ * 3       -> window with no name and width >= width of screen
++ */
++
++static ToonMatchRuleName kde2_name_rule = { "KDE Desktop" };
++static ToonMatchRule kde2_match_rules_0[]
++  = { { &kde2_name_rule, NULL, NULL, &size_rule } };
++static ToonMatchRule kde2_match_rules_1_3[]
++  = { { &noname_rule, NULL, NULL, &size_rule } };
++static ToonMatchRule kde2_match_rules_2[]
++  = { { &kde2_name_rule, NULL, &desktop_type_rule, &size_rule } };
++static ToonMatchWindow kde2_matcher_windows[] = {
++  TOON_MATCH_WINDOW(kde2_match_rules_0),
++  TOON_MATCH_WINDOW(kde2_match_rules_1_3),
++  TOON_MATCH_WINDOW(kde2_match_rules_2),
++  TOON_MATCH_WINDOW(kde2_match_rules_1_3)
++};
++static ToonMatcher kde2_matcher = TOON_MATCHER(kde2_matcher_windows,
++                                               "KDE 2", 1);
++TOON_MATCH_FUNC(__ToonGetKDE2Desktop, &kde2_matcher)
++
+ /* Look for the Nautilus desktop window to draw to, given the toplevel
+  * window of the Nautilus desktop. Basically recursively calls itself
+  * looking for subwindows the same size as the root window. */
+@@ -318,7 +459,7 @@ ToonGetRootWindow(Display *display, int screen, Window *clientparent)
+ 	      || !tmpwindow) {
+ 	    /* Must be KDE 2.1+ */
+ 	    snprintf(toon_message, TOON_MESSAGE_LENGTH,
+-		     _("Drawing to KDE Desktop"));
++		     _("Drawing to KDE 2 Desktop"));
+ 	    toon_message[TOON_MESSAGE_LENGTH-1] = '\0';
+ 	    background = *newroot;
+ 	  }
+@@ -336,15 +477,20 @@ ToonGetRootWindow(Display *display, int screen, Window *clientparent)
+ 	}
+ 	XFree((char *) newroot);
+       }
+-      else if ((background = __ToonGetKDEDesktop(display, screen, children[i],
+-						 _NET_WM_WINDOW_TYPE,
+-						 "_NET_WM_WINDOW_TYPE_DESKTOP",
+-						 0))) {
++      else if ((background = __ToonGetKDE4Desktop(display, screen,
++                                                  children[i]))) {
++	/* Found a KDE 4 plasma desktop and located the background window */
++	/* Note that the clientparent is still the root window */
++      }
++      else if ((background = __ToonGetKDE3Desktop(display, screen,
++                                                  children[i]))) {
++	/* Found a KDE 3 desktop and located the background window */
++	/* Note that the clientparent is still the root window */
++      }
++      else if ((background = __ToonGetKDE2Desktop(display, screen,
++                                                  children[i]))) {
+ 	/* Found a KDE 2.0 desktop and located the background window */
+ 	/* Note that the clientparent is still the root window */
+-	snprintf(toon_message, TOON_MESSAGE_LENGTH,
+-		 _("Drawing to KDE desktop"));
+-	toon_message[TOON_MESSAGE_LENGTH-1] = '\0';
+       }
+     }
+     XFree((char *) children);
+diff --git a/src/toon_signal.c b/src/toon_signal.c
+index 7135f0e..c093584 100644
+--- a/src/toon_signal.c
++++ b/src/toon_signal.c
+@@ -16,6 +16,7 @@
+  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+  */
+ #include <signal.h>
++#include <stdlib.h>
+ #include "toon.h"
+ 
+ /* SIGNAL AND ERROR HANDLING FUNCTIONS */
+diff --git a/xpenguins.1 b/xpenguins.1
+index 9437961..e4c468f 100644
+--- a/xpenguins.1
++++ b/xpenguins.1
+@@ -72,6 +72,17 @@ faster calculation of window positions, but if you use one of those
+ fancy new window managers with shaped windows then your toons
+ might sometimes look like they're walking on thin air.
+ .TP 8
++.B "\-g, \-\-bgcapture"
++Traditionally XPenguins erases where the penguins have been by
++clearing back to the background image of the desktop. This causes
++icons on the desktop to be overwritten and does not work with some
++recent desktops (such as KDE 4).
++This option causes XPenguins to capture an image of the desktop and
++use it to redraw the desktop behind the penguins. Icons will no longer
++get overwritten. XPenguins will also try to keep the image up to date,
++so that widgets on the desktop don't get overwritten with an old
++version too often.
++.TP 8
+ .B "\-s, \-\-squish"
+ Enable the penguins to be squished using any of the mouse
+ buttons. Note that this disables any existing function of the mouse
+-- 
+1.6.1
+
